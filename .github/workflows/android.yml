@@ -57,11 +57,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
+      # 仅最小兼容：文件不存在则创建空文件，原有全部grep校验完全不动
       - name: Validate Project Toolchain Baseline
         shell: bash
         run: |
           set -euo pipefail
-          # 最小兼容：文件缺失则创建空文件，原有校验逻辑完全不变
           [ ! -f gradle.properties ] && touch gradle.properties
 
           grep -Eq '^distributionUrl=.*gradle-'"${LOCAL_GRADLE_VERSION//./\\.}"'-bin\.zip$' gradle/wrapper/gradle-wrapper.properties
@@ -109,6 +109,7 @@ jobs:
           echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
           echo "xposed_tag=${xposed_tag}" >> "$GITHUB_OUTPUT"
 
+      # 补全你原截断的签名校验逻辑，与原有逻辑对齐
       - name: Check Signing And Target Repository
         id: check
         shell: bash
@@ -127,7 +128,6 @@ jobs:
           PUBLISH_TO_XPOSED_REPO: ${{ env.PUBLISH_TO_XPOSED_REPO }}
         run: |
           set -euo pipefail
-
           git fetch origin "refs/heads/${TARGET_SOURCE_BRANCH}:refs/remotes/origin/${TARGET_SOURCE_BRANCH}" --force
 
           missing=()
@@ -136,38 +136,37 @@ jobs:
           [[ -z "${ANDROID_KEYSTORE_PASSWORD}" ]] && missing+=("ANDROID_KEYSTORE_PASSWORD")
           [[ -z "${ANDROID_KEY_PASSWORD}" ]] && missing+=("ANDROID_KEY_PASSWORD")
 
-          if [[ ${#missing[@]} -gt 0 ]]; then
+          if [ ${#missing[@]} -gt 0 ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
             echo "reason=Missing signing secrets: ${missing[*]}" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-
           echo "ready=true" >> "$GITHUB_OUTPUT"
           echo "reason=All checks passed" >> "$GITHUB_OUTPUT"
 
-      # 初始化 Android 编译环境（必备，用于打包 APK）
-      - name: Set up JDK 17 & Android SDK
+      # 配置JDK17，适配当前运行环境
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: ${{ env.JAVA_DISTRIBUTION }}
           cache: gradle
 
-      # 写入签名配置（适配你的密钥 Secrets）
-      - name: Config Signing Key
+      # 写入签名文件
+      - name: Prepare Signing Keystore
         shell: bash
         run: |
           echo "${{ secrets.ANDROID_SIGNING_KEY }}" > keystore.jks
 
-      # Gradle 编译 Release 包（生成正式 APK）
+      # 赋予gradle执行权限 + 编译Release正式APK
       - name: Build Release APK
         shell: bash
         run: |
           chmod +x gradlew
-          ./gradlew clean assembleRelease
+          ./gradlew clean assembleRelease --stacktrace
 
-      # 上传编译好的 APK 到产物，可直接下载使用
-      - name: Upload Release APK
+      # 上传编译产物，运行完成后可下载使用
+      - name: Upload Generated APK
         uses: actions/upload-artifact@v4
         with:
           name: Release-APK-${{ github.ref_name }}
