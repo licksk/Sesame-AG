@@ -1,7 +1,6 @@
 name: Release Build
 run-name: Release Build - ${{ github.ref_name }}
 
-# 触发规则：仅推送 数字-xxx 格式 Tag 时运行
 on:
   push:
     tags:
@@ -23,7 +22,7 @@ env:
   RELEASE_TAG_RAW: ${{ github.ref_name }}
   TARGET_SOURCE_BRANCH: dev
   TARGET_MODULE_REPO: Xposed-Modules-Repo/io.github.aoguai.sesameag
-  PUBLISH_TO_XPOSED_REPO: false
+  PUBLISH_TO_XPOSED_REPO: "false"
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -31,7 +30,7 @@ concurrency:
 
 jobs:
   preflight:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -45,20 +44,36 @@ jobs:
       xposed_tag: ${{ steps.meta.outputs.xposed_tag }}
 
     steps:
-      - name: Set Timezone
+      - name: Set Timezone to Asia/Shanghai
         shell: bash
         run: |
           set -euo pipefail
           sudo timedatectl set-timezone Asia/Shanghai
           echo "Current time: $(date)"
 
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      - name: Resolve Metadata (Optimized)
+      # 仅在工具链校验前增加一行：文件不存在则创建空 gradle.properties
+      - name: Validate Project Toolchain Baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 最小修复：文件缺失时自动创建，不改动后续任何校验逻辑
+          [ ! -f gradle.properties ] && touch gradle.properties
+
+          grep -Eq '^distributionUrl=.*gradle-'"${LOCAL_GRADLE_VERSION//./\\.}"'-bin\.zip$' gradle/wrapper/gradle-wrapper.properties
+          grep -Eq '^android-plugin = "'"${LOCAL_AGP_VERSION//./\\.}"'"$' gradle/libs.versions.toml
+          grep -Eq '^kotlin = "'"${LOCAL_KOTLIN_VERSION//./\\.}"'"$' gradle/libs.versions.toml
+          grep -Eq '^appVersion=.+' gradle.properties
+          grep -Eq 'compileSdk = '"${ANDROID_API_LEVEL}"'$' app/build.gradle.kts
+          grep -Eq 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
+          grep -Eq 'targetCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
+
+      - name: Resolve Release Metadata
         id: meta
         shell: bash
         run: |
@@ -69,31 +84,25 @@ jobs:
           configured_version_name=""
           version_name=""
 
-          # 解析 Tag
           if [[ "${RELEASE_TAG_RAW}" =~ ${release_tag_regex} ]]; then
             tag_valid="true"
             tag_version_code="${BASH_REMATCH[1]}"
             version_name="${BASH_REMATCH[2]}"
           fi
 
-          # 兼容 gradle.properties 不存在 / 无 appVersion 字段，不再强制报错
-          if [ -f "gradle.properties" ]; then
-            configured_version_name=$(sed -n 's/^appVersion=//p' gradle.properties | head -n1 | tr -d '\r')
-          fi
-          # 为空则赋值默认版本
-          if [ -z "${configured_version_name}" ]; then
-            configured_version_name="1.0.0"
+          configured_version_name="$(sed -n 's/^appVersion=//p' gradle.properties | head -n1 | tr -d '\r')"
+          if [[ -z "${configured_version_name}" ]]; then
+            echo "Failed to resolve appVersion from gradle.properties" >&2
+            exit 1
           fi
 
-          # 获取 Git 提交计数作为 version_code
-          version_code=$(git rev-list --count HEAD | tr -d '\n')
-          if [ -z "${version_code}" ]; then
-            version_code="0"
+          version_code="$(git rev-list --count HEAD | tr -d '\n')"
+          if [[ -z "${version_code}" ]]; then
+            echo "Failed to resolve versionCode from git history" >&2
+            exit 1
           fi
 
           xposed_tag="${RELEASE_TAG_RAW}"
-
-          # 输出变量
           echo "tag_valid=${tag_valid}" >> "$GITHUB_OUTPUT"
           echo "tag_version_code=${tag_version_code}" >> "$GITHUB_OUTPUT"
           echo "configured_version_name=${configured_version_name}" >> "$GITHUB_OUTPUT"
@@ -101,22 +110,26 @@ jobs:
           echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
           echo "xposed_tag=${xposed_tag}" >> "$GITHUB_OUTPUT"
 
-      - name: Check Signing Config
+      - name: Check Signing And Target Repository
         id: check
         shell: bash
+        env:
+          TAG_VALID: ${{ steps.meta.outputs.tag_valid }}
+          TAG_VERSION_CODE: ${{ steps.meta.outputs.tag_version_code }}
+          CONFIGURED_VERSION_NAME: ${{ steps.meta.outputs.configured_version_name }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          XPOSED_TAG: ${{ steps.meta.outputs.xposed_tag }}
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          PUBLISH_TO_XPOSED_REPO: ${{ env.PUBLISH_TO_XPOSED_REPO }}
         run: |
           set -euo pipefail
-          missing=()
-          # 检查签名密钥环境变量
-          [[ -z "${ANDROID_SIGNING_KEY:-}" ]] && missing+=("ANDROID_SIGNING_KEY")
-          [[ -z "${ANDROID_KEY_ALIAS:-}" ]] && missing+=("ANDROID_KEY_ALIAS")
-          [[ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]] && missing+=("ANDROID_KEYSTORE_PASSWORD")
-          [[ -z "${ANDROID_KEY_PASSWORD:-}" ]] && missing+=("ANDROID_KEY_PASSWORD")
 
-          if [ ${#missing[@]} -gt 0 ]; then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Missing secrets: ${missing[*]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            echo "reason=All config ok" >> "$GITHUB_OUTPUT"
-          fi
+          git fetch origin "refs/heads/${TARGET_SOURCE_BRANCH}:refs/remotes/origin/${TARGET_SOURCE_BRANCH}" --force
+
+          missing=()
+          [[ -n "${ANDROID_SIGNING_KEY}" ]]
