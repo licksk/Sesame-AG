@@ -57,12 +57,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      # 仅在工具链校验前增加一行：文件不存在则创建空 gradle.properties
       - name: Validate Project Toolchain Baseline
         shell: bash
         run: |
           set -euo pipefail
-          # 最小修复：文件缺失时自动创建，不改动后续任何校验逻辑
+          # 最小兼容：文件缺失则创建空文件，原有校验逻辑完全不变
           [ ! -f gradle.properties ] && touch gradle.properties
 
           grep -Eq '^distributionUrl=.*gradle-'"${LOCAL_GRADLE_VERSION//./\\.}"'-bin\.zip$' gradle/wrapper/gradle-wrapper.properties
@@ -132,4 +131,45 @@ jobs:
           git fetch origin "refs/heads/${TARGET_SOURCE_BRANCH}:refs/remotes/origin/${TARGET_SOURCE_BRANCH}" --force
 
           missing=()
-          [[ -n "${ANDROID_SIGNING_KEY}" ]]
+          [[ -z "${ANDROID_SIGNING_KEY}" ]] && missing+=("ANDROID_SIGNING_KEY")
+          [[ -z "${ANDROID_KEY_ALIAS}" ]] && missing+=("ANDROID_KEY_ALIAS")
+          [[ -z "${ANDROID_KEYSTORE_PASSWORD}" ]] && missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [[ -z "${ANDROID_KEY_PASSWORD}" ]] && missing+=("ANDROID_KEY_PASSWORD")
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Missing signing secrets: ${missing[*]}" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "reason=All checks passed" >> "$GITHUB_OUTPUT"
+
+      # 初始化 Android 编译环境（必备，用于打包 APK）
+      - name: Set up JDK 17 & Android SDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: gradle
+
+      # 写入签名配置（适配你的密钥 Secrets）
+      - name: Config Signing Key
+        shell: bash
+        run: |
+          echo "${{ secrets.ANDROID_SIGNING_KEY }}" > keystore.jks
+
+      # Gradle 编译 Release 包（生成正式 APK）
+      - name: Build Release APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease
+
+      # 上传编译好的 APK 到产物，可直接下载使用
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Release-APK-${{ github.ref_name }}
+          path: ${{ env.RELEASE_DIR }}/*.apk
+          retention-days: 30
